@@ -7,6 +7,7 @@ import Common
 import Shared
 import MozillaAppServices
 import Network
+import Observation
 import VPNKit
 import WebEngine
 
@@ -15,6 +16,8 @@ enum VPNEvent: Equatable {
     /// A pass was applied, either on start or rotation.
     case passUpdated(VPNProxyPass)
     case rotationFailed
+    /// Guardian refused a pass because the monthly bandwidth quota is used up.
+    case quotaExceeded(VPNProxyUsage)
     /// The selected location had no usable server, so a fallback server was used instead.
     case selectedLocationUnavailable
 }
@@ -22,11 +25,30 @@ enum VPNEvent: Equatable {
 @MainActor
 protocol VPNRunnable {
     var isRunning: Bool { get }
+    var isConnecting: Bool { get }
+    var usedDataInGB: Double { get }
+    var dataLimitInGB: Double { get }
+    var usageFraction: Double { get }
+    var isLimitReached: Bool { get }
+    /// True once the stored usage's reset date has passed; false if no usage has been fetched.
+    var isUsageResetDue: Bool { get }
+    var selectedCountryCode: String { get }
+    /// Whether the running connection uses a fallback server because the requested location had none.
+    var isUsingFallback: Bool { get }
     /// Single-consumer stream of `VPNEvent`s, observed by `VPNMiddleware`.
     var events: AsyncStream<VPNEvent> { get }
     /// Also switches a running VPN to a new server and pass without stopping it first.
     func start(countryCode: String?) async throws
     func stop() async
+    func listCountries() async -> [VPNServerManager.Country]
+    /// Fetches the current bandwidth usage, whether or not the VPN is running.
+    func refreshUsage() async throws
+    /// Redraws views reading `selectedCountryCode` after its pref changes.
+    func selectedCountryCodeDidChange(countryCode: String)
+    /// Stops pass rotation while the app is backgrounded.
+    func pauseRotation()
+    /// Restarts pass rotation if the VPN is running, rotating right away if the pass is due.
+    func resumeRotation()
 }
 
 enum VPNError: Error {
@@ -36,20 +58,21 @@ enum VPNError: Error {
     case tokenProviderUnavailable
 }
 
-@available(iOS 17.0, *)
+@available(iOS 27.2, *)
 @MainActor
 protocol ProxyConfigurator {
     func applyProxyConfigurations(_ configs: [ProxyConfiguration], forcingSessionReset: Bool)
 }
 
-@available(iOS 17.0, *)
+@available(iOS 27.2, *)
 struct DefaultProxyConfigurator: ProxyConfigurator {
     func applyProxyConfigurations(_ configs: [ProxyConfiguration], forcingSessionReset: Bool) {
         DefaultWKEngineConfigurationProvider.applyProxyConfigurations(configs, forcingSessionReset: forcingSessionReset)
     }
 }
 
-@available(iOS 17.0, *)
+@available(iOS 27.2, *)
+@Observable
 final class VPNManager: VPNRunnable {
     private let logger: Logger
     private let environment: VPNEnvironment
@@ -57,16 +80,57 @@ final class VPNManager: VPNRunnable {
     private let serverManager: VPNServerManaging
     private let windowManager: WindowManager
     private let proxyApplier: ProxyConfigurator
+    private let prefs: Prefs
     private let eventsContinuation: AsyncStream<VPNEvent>.Continuation
     let events: AsyncStream<VPNEvent>
 
     private var activeServer: VPNGuardian.Server?
+    private(set) var isUsingFallback = false
 
-    // TODO: fxios-16876 This will get used when we wire up VPN Connection
     var isRunning: Bool {
         activeServer != nil
     }
+
+    private(set) var isConnecting = false
+
+    var selectedCountryCode: String {
+        // Used with withMutation(keyPath: ) farther down so that SwiftUI observes this computed property
+        access(keyPath: \.selectedCountryCode)
+        return prefs.stringForKey(PrefsKeys.VPNSettings.selectedCountryCode) ?? VPNServerManager.recommendedCountryCode
+    }
+
+    private var currentUsage: VPNProxyUsage?
+    private static let bytesPerGB: UInt64 = 0x1 << 30
+
+    var dataLimitInGB: Double {
+        guard let usage = currentUsage else { return 0 }
+        return Double(usage.max) / Double(Self.bytesPerGB)
+    }
+
+    var usedDataInGB: Double {
+        guard let usage = currentUsage else { return 0 }
+        return Double(min(max(usage.max - usage.remaining, 0), usage.max)) / Double(Self.bytesPerGB)
+    }
+
+    var usageFraction: Double {
+        guard let usage = currentUsage, usage.max > 0 else { return 0 }
+        return usedDataInGB / dataLimitInGB
+    }
+
+    var isLimitReached: Bool {
+        guard let usage = currentUsage, !isUsageResetDue else { return false }
+        return !usage.unlimited && usage.remaining <= 0
+    }
+
+    var isUsageResetDue: Bool {
+        guard let usage = currentUsage else { return false }
+        return usage.reset <= Date()
+    }
+
     private var rotationTask: Task<Void, Never>?
+    /// Most recently applied pass, used to resume rotation when returning to the foreground.
+    private var latestPass: VPNProxyPass?
+    private var isRotationPaused = false
 
     init(
         logger: Logger = DefaultLogger.shared,
@@ -86,6 +150,7 @@ final class VPNManager: VPNRunnable {
         )
         self.windowManager = windowManager
         self.proxyApplier = proxyApplier
+        self.prefs = profile.prefs
         let (events, eventsContinuation) = AsyncStream<VPNEvent>.makeStream()
         self.events = events
         self.eventsContinuation = eventsContinuation
@@ -94,11 +159,20 @@ final class VPNManager: VPNRunnable {
     /// When already running, the proxy stays on the old server until the new one is applied,
     /// so a failure leaves it running as-is.
     func start(countryCode: String?) async throws {
+        isConnecting = true
+        defer { isConnecting = false }
         guard let guardian = self.guardian else {
             throw VPNError.tokenProviderUnavailable
         }
 
-        let pass = try await guardian.getPass()
+        let pass: VPNProxyPass
+        do {
+            pass = try await guardian.getPass()
+        } catch VPNAuthError.quotaExceeded(let usage) {
+            currentUsage = usage
+            eventsContinuation.yield(.quotaExceeded(usage))
+            throw VPNAuthError.quotaExceeded(usage)
+        }
 
         guard let selection = await serverManager.selectServer(countryCode: countryCode, environment: environment) else {
             throw VPNError.noServerFound
@@ -113,9 +187,12 @@ final class VPNManager: VPNRunnable {
         let config = try self.buildProxyConfig(server: server, pass: pass)
         await self.applyProxyAndRebuildWebViews(configs: [config])
         self.activeServer = server
+        self.isUsingFallback = selection.didFallBack
+        self.currentUsage = pass.usage
         self.startPassRotation(after: pass)
         self.eventsContinuation.yield(.passUpdated(pass))
         if selection.didFallBack {
+            selectedCountryCodeDidChange(countryCode: server.countryCode)
             self.eventsContinuation.yield(.selectedLocationUnavailable)
         }
     }
@@ -123,8 +200,43 @@ final class VPNManager: VPNRunnable {
     func stop() async {
         self.rotationTask?.cancel()
         self.rotationTask = nil
+        self.latestPass = nil
         await self.applyProxyAndRebuildWebViews(configs: [])
         self.activeServer = nil
+        self.isUsingFallback = false
+    }
+
+    func listCountries() async -> [VPNServerManager.Country] {
+        return await serverManager.listCountries()
+    }
+
+    func refreshUsage() async throws {
+        guard let guardian else {
+            throw VPNError.tokenProviderUnavailable
+        }
+        currentUsage = try await guardian.getUsage()
+    }
+
+    func selectedCountryCodeDidChange(countryCode: String) {
+        // Needed for SwiftUI to observe changes to computed properties
+        withMutation(keyPath: \.selectedCountryCode) {
+            prefs.setString(countryCode, forKey: PrefsKeys.VPNSettings.selectedCountryCode)
+        }
+    }
+
+    /// A rotation started during a background wake can be suspended mid-request, which exhausts
+    /// `VPNGuardian.rotationTimeout` and fails the rotation on resume, so rotation only runs in the foreground.
+    func pauseRotation() {
+        isRotationPaused = true
+        rotationTask?.cancel()
+        rotationTask = nil
+    }
+
+    /// An overdue pass rotates almost immediately, since `passRotation` floors its delay at `minRotationInterval`.
+    func resumeRotation() {
+        isRotationPaused = false
+        guard rotationTask == nil, isRunning, let latestPass else { return }
+        startPassRotation(after: latestPass)
     }
 
     /// Consumes `VPNGuardian.passRotation` and reapplies the proxy configuration with the new
@@ -133,7 +245,10 @@ final class VPNManager: VPNRunnable {
     /// proxy's grace period, and new requests pick up the rotated header. Forcing the reset
     /// here would tear down sessions out from under webviews that are still loading.
     private func startPassRotation(after initial: VPNProxyPass) {
+        latestPass = initial
         rotationTask?.cancel()
+        rotationTask = nil
+        guard !isRotationPaused else { return }
         rotationTask = Task { [weak self] in
             guard let stream = self?.guardian?.passRotation(after: initial) else { return }
             do {
@@ -142,6 +257,8 @@ final class VPNManager: VPNRunnable {
                           let server = self.activeServer else { return }
                     let config = try self.buildProxyConfig(server: server, pass: new)
                     self.proxyApplier.applyProxyConfigurations([config], forcingSessionReset: false)
+                    self.latestPass = new
+                    self.currentUsage = new.usage
                     self.eventsContinuation.yield(.passUpdated(new))
                     self.logger.log(
                         "Rotated VPN proxy pass — next expiry \(new.expiresAt)",
@@ -149,6 +266,10 @@ final class VPNManager: VPNRunnable {
                         category: .vpn
                     )
                 }
+            } catch VPNAuthError.quotaExceeded(let usage) {
+                self?.logger.log("Pass rotation stopped: quota exceeded", level: .warning, category: .vpn)
+                self?.currentUsage = usage
+                self?.eventsContinuation.yield(.quotaExceeded(usage))
             } catch {
                 self?.logger.log(
                     "Pass rotation failed terminally, stopping rotation: \(error)",

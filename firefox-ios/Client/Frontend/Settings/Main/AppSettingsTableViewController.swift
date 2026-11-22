@@ -452,8 +452,8 @@ class AppSettingsTableViewController: SettingsTableViewController,
             )
         }
 
-        // VPN backend is only possible on iOS 17 and later
-        if #available(iOS 17.0, *), featureFlagsProvider.isEnabled(.vpnFeature) {
+        // VPN backend is only possible on iOS 27.2 and later
+        if #available(iOS 27.2, *), featureFlagsProvider.isEnabled(.vpnFeature) {
             privacySettings.append(VPNSetting(settings: self, settingsDelegate: parentCoordinator))
         }
 
@@ -568,6 +568,8 @@ class AppSettingsTableViewController: SettingsTableViewController,
         hiddenDebugOptions.append(ClearVPNSessionSetting(settings: self))
         hiddenDebugOptions.append(ShowVPNFailureAlertSetting(settings: self))
         hiddenDebugOptions.append(ShowVPNDataLimitAlertSetting(settings: self))
+        // TODO: FXIOS-17399 Remove simulateQuotaExceeded debug hook after testing
+        hiddenDebugOptions.append(SimulateVPNQuotaExceededSetting(settings: self))
         hiddenDebugOptions.append(DeleteAppAttestKeySetting(settings: self))
         hiddenDebugOptions.append(InstallationDetailsSetting(settings: self))
         hiddenDebugOptions.append(ResetInstallationHistorySetting(settings: self))

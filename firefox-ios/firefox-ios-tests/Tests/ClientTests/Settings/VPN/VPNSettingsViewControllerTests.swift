@@ -8,15 +8,19 @@ import XCTest
 
 @testable import Client
 
-@available(iOS 17.0, *)
+@available(iOS 27.2, *)
 @MainActor
 final class VPNSettingsViewControllerTests: XCTestCase {
+    private var vpnManager: MockVPNManager!
+
     override func setUp() async throws {
         try await super.setUp()
         DependencyHelperMock().bootstrapDependencies()
+        vpnManager = MockVPNManager()
     }
 
     override func tearDown() async throws {
+        vpnManager = nil
         DependencyHelperMock().reset()
         try await super.tearDown()
     }
@@ -45,8 +49,8 @@ final class VPNSettingsViewControllerTests: XCTestCase {
     private func createSubject() -> VPNSettingsViewController {
         let subject = VPNSettingsViewController(
             windowUUID: .XCTestDefaultUUID,
-            prefs: MockProfilePrefs(),
-            themeManager: MockThemeManager()
+            themeManager: MockThemeManager(),
+            vpnManager: vpnManager
         )
         trackForMemoryLeaks(subject)
         return subject
